@@ -1,0 +1,6 @@
+Sohu2022_data/nlp_data/test.txt
+Sohu2022_data/nlp_data/train.txt
+Sohu2022_data/rec_data/test-dataset.csv
+Sohu2022_data/rec_data/train-dataset.csv
+Sohu2022_data/rec_data/recommend_content_entity_0317.txt
+.DS_Store
