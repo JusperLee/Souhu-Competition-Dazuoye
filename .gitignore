@@ -5,4 +5,4 @@ emo/bert-base-chineses/*
 *.ipynb
 TMM_copy/
 TMM_for_MAMS/
-my_own_pipeline_task1/chinese-roberta-wwm-extt-test
+likai_task1/chinese-roberta-wwm-extt-test
