@@ -2,7 +2,7 @@
 # Author: Kai Li
 # Date: 2022-04-14 11:19:17
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-14 13:46:16
+# LastEditTime: 2022-04-14 15:06:17
 ###
 import warnings
 warnings.filterwarnings("ignore")
@@ -41,7 +41,7 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 
-def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
+def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device, writer):
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=CFG.apex)
     losses = AverageMeter()
@@ -63,6 +63,7 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
         losses.update(loss.item(), batch_size)
+        writer.add_scalar("train_fold:{}_LOSS_step".format(fold), loss.item(), global_step*(epoch+1))
         scaler.scale(loss).backward()
         # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
         if (step + 1) % CFG.gradient_accumulation_steps == 0:
@@ -82,11 +83,13 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
             train_true_tmp = np.array(train_true)
             avg_acc = accuracy_score(train_true_tmp, train_pred_tmp)
             avg_f1s = f1_score(train_true_tmp, train_pred_tmp, average='macro')
+            writer.add_scalar("train_fold:{}_ACC_step".format(fold), 100 * avg_acc, global_step*(epoch+1))
+            writer.add_scalar("train_fold:{}_F1_step".format(fold), 100 * avg_f1s, global_step*(epoch+1))
         
-        tk0.set_postfix(Epoch=epoch+1, Loss=losses.avg,lr=scheduler.get_lr()[0], ACC=100 * avg_acc, F1=100 * avg_f1s)
+        tk0.set_postfix(Fold=fold, Epoch=epoch+1, Loss=losses.avg,lr=scheduler.get_lr()[0], ACC=100 * avg_acc, F1=100 * avg_f1s)
     return losses.avg
 
-def valid_fn(valid_loader, model, device):
+def valid_fn(fold, epoch, valid_loader, model, device, writer):
     losses = AverageMeter()
     model.eval()
     # preds = []
@@ -110,18 +113,23 @@ def valid_fn(valid_loader, model, device):
         for item in np.array(batch[3].cpu()):
             valid_true.append(item)
         tk0.set_postfix(Loss=losses.avg)
+    
     print('Test set: Average loss: {:.4f}'.format(losses.avg))
     valid_true = np.array(valid_true)
     valid_pred = np.array(valid_pred)
     avg_acc = accuracy_score(valid_true, valid_pred)
     avg_f1s = f1_score(valid_true, valid_pred, average='macro')
-
+    
+    writer.add_scalar("valid_fold:{}_LOSS_epoch".format(fold), loss.item(), epoch+1)
+    writer.add_scalar("valid_fold:{}_ACC_epoch".format(fold), 100 * avg_acc, epoch+1)
+    writer.add_scalar("valid_fold:{}_F1_epoch".format(fold), 100 * avg_f1s, epoch+1)
+    
     print('Average: Accuracy: {:.3f}%, F1Score: {:.3f}'.format(100 * avg_acc, 100 * avg_f1s))
     print(classification_report(valid_true, valid_pred))
 
     return avg_acc, avg_f1s, losses.avg
 
-def train_loop(train_datas, val_datas, fold, LOGGER):
+def train_loop(train_datas, val_datas, fold, LOGGER, writer):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     LOGGER.info(f"========== fold: {fold} training ==========")
     LOGGER.info(f"========== loading datasets ==========")
@@ -177,7 +185,7 @@ def train_loop(train_datas, val_datas, fold, LOGGER):
     def get_scheduler(cfg, optimizer, num_train_steps):
         if cfg.scheduler=='linear':
             scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=cfg.num_warmup_steps, num_training_steps=num_train_steps
+                optimizer, num_warmup_steps=int(num_train_steps*0.1), num_training_steps=num_train_steps
             )
         else :
             scheduler = get_cosine_schedule_with_warmup(
@@ -197,11 +205,11 @@ def train_loop(train_datas, val_datas, fold, LOGGER):
         start_time = time.time()
 
         # train
-        avg_loss = train_fn(fold, train_loader, model, optimizer, epoch, scheduler, device)
+        avg_loss = train_fn(fold, train_loader, model, optimizer, epoch, scheduler, device, writer)
 
 
         # eval
-        avg_acc, avg_f1s, valid_loss = valid_fn(valid_loader, model, device)
+        avg_acc, avg_f1s, valid_loss = valid_fn(fold, epoch, valid_loader, model, device, writer)
 
         elapsed = time.time() - start_time
 

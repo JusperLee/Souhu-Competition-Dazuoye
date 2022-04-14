@@ -2,7 +2,7 @@
 # Author: Kai Li
 # Date: 2022-04-14 11:55:59
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-14 12:47:30
+# LastEditTime: 2022-04-14 14:53:35
 ###
 import warnings
 warnings.filterwarnings("ignore")
@@ -28,6 +28,7 @@ import scipy as sp
 from tqdm.auto import tqdm
 from sklearn.metrics import f1_score, classification_report, accuracy_score
 from sklearn.model_selection import StratifiedKFold, GroupKFold, KFold,StratifiedGroupKFold
+from torch.utils.tensorboard import SummaryWriter
 from config import CFG
 import torch
 import torch.nn as nn
@@ -47,10 +48,13 @@ transformers.logging.set_verbosity_error()
 os.makedirs(os.path.join("./", CFG.exp_name), exist_ok=True)
 os.makedirs(os.path.join('./', CFG.exp_name, "checkpoint"), exist_ok=True)
 os.makedirs(os.path.join('./', CFG.exp_name, "{}".format(CFG.model.split('/')[-1])), exist_ok=True)
+os.makedirs(os.path.join('./', "tensorboard", CFG.exp_name), exist_ok=True)
 os.environ['TOKENIZERS_PARALLELISM']="true"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 seed_everything(seed=42)
 LOGGER = get_logger(CFG.exp_name+'/train')
+
+writer = SummaryWriter(os.path.join('./', "tensorboard", CFG.exp_name))
 
 Fold = KFold(n_splits=CFG.n_fold)
 instances = pickle.load(open('/home/likai/souhu/TMM_for_MAMS/ATSA/train.pickle','rb'))
@@ -62,5 +66,5 @@ for n, (train_index, val_index) in enumerate(Fold.split(instances)):
     val_indexs[n] = val_index
 instances = np.array(instances)
 for fold in range(CFG.n_fold):
-    train_loop(instances[train_indexs[fold]].tolist(), instances[val_indexs[fold]].tolist(), fold, LOGGER)
+    train_loop(instances[train_indexs[fold]].tolist(), instances[val_indexs[fold]].tolist(), fold, LOGGER, writer)
     
