@@ -2,7 +2,7 @@
 # Author: Kai Li
 # Date: 2022-04-14 12:04:57
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-14 13:40:47
+# LastEditTime: 2022-04-14 15:22:19
 ###
 
 import torch
@@ -40,7 +40,9 @@ class TrainDataset(Dataset):
         if len(sentence_token['input_ids']) < self.max_len:
             sentence_token['input_ids'] += ([0] * (self.max_len - len(sentence_token['input_ids'])))
             sentence_token['attention_mask'] += ([0] * (self.max_len - len(sentence_token['attention_mask'])))
-            
+        if len(sentence_token['input_ids']) > self.max_len:
+            sentence_token['input_ids'] = sentence_token['input_ids'][:self.max_len]
+            sentence_token['attention_mask'] = sentence_token['attention_mask'][:self.max_len]
         return {"input_ids": torch.from_numpy(np.array(sentence_token['input_ids'], dtype='int64')), 
                 "attention_mask": torch.from_numpy(np.array(sentence_token['attention_mask'], dtype='int64')), 
                 "label": torch.from_numpy(np.array([label], dtype='int64')),

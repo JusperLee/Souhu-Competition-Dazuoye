@@ -2,20 +2,18 @@
 # Author: Kai Li
 # Date: 2022-04-14 13:50:45
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-14 13:50:46
+# LastEditTime: 2022-04-14 15:23:24
 ###
 import gc
 import pickle
 import json
 from tqdm import tqdm
 import pandas as pd
-from configs import BaseConfigs
 from instance import ACSAInstance, ATSAInstance
 import xml.etree.ElementTree
 
 class Preprocessor(object):
-    def __init__(self,configs):
-        self.configs=configs
+    def __init__(self,):
 
     def preprocess_ACSA(self,src,dst):
         instances=[]
@@ -70,6 +68,5 @@ class Preprocessor(object):
             pickle.dump(instances,f)
 
 if __name__=='__main__':
-    configs=BaseConfigs()
-    processor=Preprocessor(configs)
+    processor=Preprocessor()
     processor.preprocess_ATSA('/home/likai/souhu/emo/Sohu2022_data/nlp_data/train.txt','ATSA/train.pickle')
