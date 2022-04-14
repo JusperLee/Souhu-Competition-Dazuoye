@@ -1,6 +1,8 @@
-Sohu2022_data/nlp_data/test.txt
-Sohu2022_data/nlp_data/train.txt
-Sohu2022_data/rec_data/test-dataset.csv
-Sohu2022_data/rec_data/train-dataset.csv
-Sohu2022_data/rec_data/recommend_content_entity_0317.txt
+emo/
 .DS_Store
+emo/bert-base-chineses/*
+*.pyc
+*.ipynb
+TMM_copy/
+TMM_for_MAMS/
+my_own_pipeline_task1/chinese-roberta-wwm-extt-test
