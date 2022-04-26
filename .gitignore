@@ -6,3 +6,7 @@ emo/bert-base-chineses/*
 TMM_copy/
 TMM_for_MAMS/
 likai_task1/chinese-roberta-wwm-extt-test
+likai_task1/tensorboard
+likai_task1/data
+*.bin
+*.pth

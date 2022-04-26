@@ -2,7 +2,7 @@
 # Author: Kai Li
 # Date: 2022-04-14 11:19:17
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-14 15:06:17
+# LastEditTime: 2022-04-15 06:22:42
 ###
 import warnings
 warnings.filterwarnings("ignore")
@@ -89,7 +89,7 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device, writ
         tk0.set_postfix(Fold=fold, Epoch=epoch+1, Loss=losses.avg,lr=scheduler.get_lr()[0], ACC=100 * avg_acc, F1=100 * avg_f1s)
     return losses.avg
 
-def valid_fn(fold, epoch, valid_loader, model, device, writer):
+def valid_fn(fold, epoch, valid_loader, model, device, LOGGER, writer):
     losses = AverageMeter()
     model.eval()
     # preds = []
@@ -110,7 +110,7 @@ def valid_fn(fold, epoch, valid_loader, model, device, writer):
         batch_pred = y_preds.detach().cpu().numpy()
         for item in batch_pred:
             valid_pred.append(item.argmax(-1))
-        for item in np.array(batch[3].cpu()):
+        for item in np.array(batch['label'].cpu()):
             valid_true.append(item)
         tk0.set_postfix(Loss=losses.avg)
     
@@ -124,8 +124,8 @@ def valid_fn(fold, epoch, valid_loader, model, device, writer):
     writer.add_scalar("valid_fold:{}_ACC_epoch".format(fold), 100 * avg_acc, epoch+1)
     writer.add_scalar("valid_fold:{}_F1_epoch".format(fold), 100 * avg_f1s, epoch+1)
     
-    print('Average: Accuracy: {:.3f}%, F1Score: {:.3f}'.format(100 * avg_acc, 100 * avg_f1s))
-    print(classification_report(valid_true, valid_pred))
+    LOGGER.info('Average: Accuracy: {:.3f}%, F1Score: {:.3f}'.format(100 * avg_acc, 100 * avg_f1s))
+    LOGGER.info(classification_report(valid_true, valid_pred))
 
     return avg_acc, avg_f1s, losses.avg
 
@@ -209,7 +209,7 @@ def train_loop(train_datas, val_datas, fold, LOGGER, writer):
 
 
         # eval
-        avg_acc, avg_f1s, valid_loss = valid_fn(fold, epoch, valid_loader, model, device, writer)
+        avg_acc, avg_f1s, valid_loss = valid_fn(fold, epoch, valid_loader, model, device, LOGGER, writer)
 
         elapsed = time.time() - start_time
 
