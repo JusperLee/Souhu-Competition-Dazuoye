@@ -1,16 +1,15 @@
 ###
 # Author: Kai Li
-# Date: 2022-04-25 08:18:16
+# Date: 2022-05-02 09:59:18
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-27 07:56:37
+# LastEditTime: 2022-05-02 10:04:42
 ###
 # %%
 import os
 
-OUTPUT_DIR = './souhu_AE/'
+OUTPUT_DIR = './souhu_gradnorm/'
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
-os.makedirs(os.path.join(OUTPUT_DIR, 'pretrain'), exist_ok=True)
 
 # %%
 import pandas as pd
@@ -46,7 +45,6 @@ from torch.utils.data import DataLoader, Dataset
 import transformers
 print(f"transformers.__version__: {transformers.__version__}")
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from tokenizers import decoders
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 # from  dice_loss import  DiceLoss
 transformers.logging.set_verbosity_error()
@@ -58,7 +56,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class CFG:
     apex=True
     num_workers=0
-    model="/home/likai/souhu/likai_task1/souhu_AE/pretrain/deberta-v3-base"    # huggingface 预训练模型
+    model="microsoft/deberta-v3-base"    # huggingface 预训练模型
     scheduler='cosine'                   # ['linear', 'cosine'] # lr scheduler 类型
     batch_scheduler=True                 # 是否每个step结束后更新 lr scheduler
     num_cycles=0.5                       # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
@@ -71,7 +69,7 @@ class CFG:
     max_len=512                     
     weight_decay=0.01        
     gradient_accumulation_steps=1        # 梯度累计步数，1代表每个batch更新一次
-    # max_grad_norm=1000  
+    max_grad_norm=1000  
     seed=42 
     n_fold=4                             # 总共划分数据的份数
     trn_fold=[0,1,2,3]                   # 需要训练的折数，比如一共划分了4份，则可以对应训练4个模型，1代表用编号为1的折做验证，其余折做训练
@@ -176,38 +174,15 @@ CFG.tokenizer = tokenizer
 # %%
 # 使用HF tokenzier 对输入（ 文本+ 情感关键词）进行编码，同一处理成CFG里定义的最大长度
 def prepare_input(cfg, text, feature_text):
-    
-    if len(text) > 460:
-        start = text.find(feature_text)
-        before = text[:start+len(feature_text)+1]
-        after = text[start+len(feature_text)+1:]
-        if len(before) >= 230 and len(after) >= 230:
-            text = text[start-230:start+230]
-        if len(before) >= 230 and len(after) < 230:
-            text = text[start-230:start+len(after)]
-        if len(before) < 230 and len(after) >= 230:
-            text = text[start-len(after):start+230]
-        # import pdb; pdb.set_trace()
-    aspect_from_pos = text.find(feature_text)
-    text = text[:aspect_from_pos+len(text)-len(text)]+'[AS]{}[AE]'.format(feature_text)+text[aspect_from_pos+len(feature_text):]
-    special_tokens_dict = {'additional_special_tokens': ['[AS]','[AE]']}
-    num_added_toks = CFG.tokenizer.add_special_tokens(special_tokens_dict)
-    inputs = cfg.tokenizer(text,
+    inputs = cfg.tokenizer(text, feature_text, 
                            add_special_tokens=True,
                            truncation = True,
                            max_length=CFG.max_len,
                            padding="max_length",
                            return_offsets_mapping=False)
-    
-    try:
-        idx = inputs['input_ids'].index(128001)
-    except ValueError:
-        import pdb; pdb.set_trace()
-    
     for k, v in inputs.items():
         inputs[k] = torch.tensor(v, dtype=torch.long)
-    return inputs, torch.tensor(idx, dtype=torch.long)
-
+    return inputs
 # 将tokenizer编码完成的输入 以及 对应的情感标签 处理成tensor，供模型训练
 class TrainDataset(Dataset):
     def __init__(self, cfg, df):
@@ -220,19 +195,12 @@ class TrainDataset(Dataset):
         return len(self.entitys)
 
     def __getitem__(self, item):
-        inputs, idx = prepare_input(self.cfg, 
+        inputs = prepare_input(self.cfg, 
                                self.contents[item], 
                                self.entitys[item])
         labels = torch.tensor(self.labels[item], dtype=torch.long)
-        return inputs, idx, labels
+        return inputs, labels
 
-# # 测试dataset
-# from tqdm import tqdm
-# testdataset = TrainDataset(CFG, train)
-# for idx in tqdm(range(len(testdataset))):
-#     inputs, idxs, labels = testdataset[idx]
-
-# import pdb; pdb.set_trace()
 # %%
 # 定义模型结构，该结构是取预训练模型最后一层encoder输出，形状为[batch_size, sequence_length, hidden_size]，
 # 在1维取平均，得到[batch_size, hidden_size]的特征向量，传递给分类层得到[batch_size, 5]的向量输出，代表每条文本在五个类别上的得分，最后使用softmax将得分规范化
@@ -270,19 +238,19 @@ class CustomModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         
-    def feature(self, inputs, idxs):
-        outputs = self.model(**inputs, output_hidden_states=True)
-        last_hidden_states = outputs.last_hidden_state[0, idxs]
+    def feature(self, inputs):
+        outputs = self.model(**inputs)
+        last_hidden_states = torch.mean(outputs[0], axis=1)
         return last_hidden_states
     
-    def loss(self, logits, labels):
+    def loss(self,logits,labels):
         loss_fnc = nn.CrossEntropyLoss()
         # loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
         loss = loss_fnc(logits, labels)
         return loss
 
-    def forward(self, inputs, idxs, labels=None):
-        feature = self.feature(inputs, idxs)
+    def forward(self, inputs,labels=None):
+        feature = self.feature(inputs)
         logits1 = self.fc(self.drop1(feature))
         logits2 = self.fc(self.drop2(feature))
         logits3 = self.fc(self.drop3(feature))
@@ -329,19 +297,18 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
     global_step = 0
     grad_norm = 0
     tk0=tqdm(enumerate(train_loader),total=len(train_loader))
-    for step, (inputs, idxs, labels) in tk0:
+    for step, (inputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
         labels = labels.to(device)
-        idxs = idxs.to(device)
         batch_size = labels.size(0)
         with torch.cuda.amp.autocast(enabled=CFG.apex):
-            y_preds,loss = model(inputs, idxs, labels)
+            y_preds,loss = model(inputs,labels)
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
         losses.update(loss.item(), batch_size)
         scaler.scale(loss).backward()
-        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
         if (step + 1) % CFG.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
@@ -362,14 +329,13 @@ def valid_fn(valid_loader, model, device):
     valid_true = []
     valid_pred = []
     tk0=tqdm(enumerate(valid_loader),total=len(valid_loader))
-    for step, (inputs, idxs, labels) in tk0:
+    for step, (inputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
         labels = labels.to(device)
-        idxs = idxs.to(device)
         batch_size = labels.size(0)
         with torch.no_grad():
-            y_preds,loss = model(inputs,idxs,labels)
+            y_preds,loss = model(inputs,labels)
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
         losses.update(loss.item(), batch_size)
@@ -506,10 +472,10 @@ class TestDataset(Dataset):
         return len(self.entitys)
 
     def __getitem__(self, item):
-        inputs, idxs = prepare_input(self.cfg, 
+        inputs = prepare_input(self.cfg, 
                                self.contents[item], 
                                self.entitys[item])
-        return inputs, idxs
+        return inputs
 def test_and_save_reault(device, test_loader, test_ids, result_path):
     raw_preds = []
     test_pred = []
@@ -521,12 +487,11 @@ def test_and_save_reault(device, test_loader, test_ids, result_path):
         model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, f"model_fold{fold}_best.bin"),map_location=torch.device('cuda')))
         model.eval()
         tk0 = tqdm(test_loader, total=len(test_loader))
-        for step, (inputs, idxs) in tk0:
+        for inputs in tk0:
             for k, v in inputs.items():
                 inputs[k] = v.to(device)
-            idxs = idxs.to(device)
             with torch.no_grad():
-                y_pred_pa_all,_ = model(inputs, idxs)
+                y_pred_pa_all,_ = model(inputs)
             batch_pred = (y_pred_pa_all.detach().cpu().numpy())/CFG.n_fold
             if fold == 0:
                 raw_preds.append(batch_pred)
