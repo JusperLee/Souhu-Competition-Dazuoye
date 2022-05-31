@@ -1,5 +1,7 @@
 # 2022 Sohu Campus Emotion Analysis × Recommendation Sorting Algorithm Competition
 
+[Competition Website](https://www.biendata.xyz/competition/sohu_2022/)
+
 ```
 ├── README
 ├── Task1
