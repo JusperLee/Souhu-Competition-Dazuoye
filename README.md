@@ -101,7 +101,7 @@ python baseline-torch-tf.py --batch_size=2048 --info=25epoch-20decay-bs2048
 ## License
 MIT License
 
-Copyright (c) 2022 Kai Li (李凯)
+Copyright (c) 2022 YIQIEWEILEDAZUOYE
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
