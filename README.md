@@ -92,7 +92,7 @@ python baseline-torch-tf.py --batch_size=2048 --info=25epoch-20decay-bs2048
   year = {2022},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/JusperLee/LRS3-For-Speech-Separation}},
+  howpublished = {\url{https://github.com/JusperLee/Souhu-Competition-Dazuoye}},
 }
 ```
 
