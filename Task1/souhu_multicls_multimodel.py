@@ -1,13 +1,7 @@
-###
-# Author: Kai Li
-# Date: 2022-05-02 09:57:56
-# Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-05-02 10:45:50
-###
 # %%
 import os
 
-OUTPUT_DIR = './souhu_diceloss/'
+OUTPUT_DIR = './souhu_multicls_multimodel/'
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
@@ -46,7 +40,7 @@ import transformers
 print(f"transformers.__version__: {transformers.__version__}")
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-from  dice_loss import  DiceLoss
+# from  dice_loss import  DiceLoss
 transformers.logging.set_verbosity_error()
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -56,7 +50,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class CFG:
     apex=True
     num_workers=8
-    model="microsoft/deberta-v3-base"    # huggingface 预训练模型
+    model="longformer-chinese-base-4096"    # huggingface 预训练模型
     scheduler='cosine'                   # ['linear', 'cosine'] # lr scheduler 类型
     batch_scheduler=True                 # 是否每个step结束后更新 lr scheduler
     num_cycles=0.5                       # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
@@ -65,11 +59,11 @@ class CFG:
     last_epoch=-1                        # 从第 last_epoch +1 个epoch开始训练
     encoder_lr=2e-5                      # 预训练模型内部参数的学习率
     decoder_lr=2e-5                      # 自定义输出层的学习率
-    batch_size=32                       
-    max_len=512                     
+    batch_size=64                       
+    max_len=600                     
     weight_decay=0.01        
-    gradient_accumulation_steps=1        # 梯度累计步数，1代表每个batch更新一次
-    # max_grad_norm=1000  
+    gradient_accumulation_steps=2       # 梯度累计步数，1代表每个batch更新一次
+    max_grad_norm=5  
     seed=42 
     n_fold=4                             # 总共划分数据的份数
     trn_fold=[0,1,2,3]                   # 需要训练的折数，比如一共划分了4份，则可以对应训练4个模型，1代表用编号为1的折做验证，其余折做训练
@@ -134,12 +128,15 @@ def get_test_data(input_file):
     entitys = []
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-        for line in lines:
+        for line in tqdm(lines):
             tmp = json.loads(line.strip())
             raw_id = tmp['id']
             raw_contents = tmp['content']
             raw_entitys = tmp['entity']
-            for entity in [raw_entitys]:
+            # import pdb; pdb.set_trace()
+            if raw_entitys == None:
+                continuous
+            for entity in raw_entitys:
                 text = raw_contents.strip()
                 corpus.append(text)
                 ids.append(raw_id)
@@ -171,6 +168,9 @@ train['fold'] = train['fold'].astype(int)
 tokenizer = AutoTokenizer.from_pretrained(CFG.model)
 CFG.tokenizer = tokenizer
 
+xltokenizer = AutoTokenizer.from_pretrained("chinese-xlnet-mid")
+CFG.xltokenizer = xltokenizer
+
 # %%
 # 使用HF tokenzier 对输入（ 文本+ 情感关键词）进行编码，同一处理成CFG里定义的最大长度
 def prepare_input(cfg, text, feature_text):
@@ -180,9 +180,17 @@ def prepare_input(cfg, text, feature_text):
                            max_length=CFG.max_len,
                            padding="max_length",
                            return_offsets_mapping=False)
+    xlinputs = cfg.xltokenizer(text, feature_text, 
+                           add_special_tokens=True,
+                           truncation = True,
+                           max_length=CFG.max_len,
+                           padding="max_length",
+                           return_offsets_mapping=False)
     for k, v in inputs.items():
         inputs[k] = torch.tensor(v, dtype=torch.long)
-    return inputs
+    for k, v in xlinputs.items():
+        xlinputs[k] = torch.tensor(v, dtype=torch.long)
+    return inputs, xlinputs
 # 将tokenizer编码完成的输入 以及 对应的情感标签 处理成tensor，供模型训练
 class TrainDataset(Dataset):
     def __init__(self, cfg, df):
@@ -195,16 +203,32 @@ class TrainDataset(Dataset):
         return len(self.entitys)
 
     def __getitem__(self, item):
-        inputs = prepare_input(self.cfg, 
+        inputs, xlinputs = prepare_input(self.cfg, 
                                self.contents[item], 
                                self.entitys[item])
         labels = torch.tensor(self.labels[item], dtype=torch.long)
-        return inputs, labels
+        return inputs, xlinputs, labels
 
 # %%
 # 定义模型结构，该结构是取预训练模型最后一层encoder输出，形状为[batch_size, sequence_length, hidden_size]，
 # 在1维取平均，得到[batch_size, hidden_size]的特征向量，传递给分类层得到[batch_size, 5]的向量输出，代表每条文本在五个类别上的得分，最后使用softmax将得分规范化
 # 训练过程中额外对 取平均后的输出做了5次dropout，并计算五次loss取平均，该方法可以加速模型收敛，相关思路可参考论文： https://arxiv.org/pdf/1905.09788.pdf
+
+class AttentionHead(nn.Module):
+    def __init__(self, h_size, hidden_dim=512):
+        super().__init__()
+        self.W = nn.Linear(h_size, hidden_dim)
+        self.V = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, features):
+        att = torch.tanh(self.W(features))
+        score = self.V(att)
+        attention_weights = torch.softmax(score, dim=1)
+        context_vector = attention_weights * features
+        context_vector = torch.sum(context_vector, dim=1)
+
+        return context_vector
+
 class CustomModel(nn.Module):
     def __init__(self, cfg, config_path=None, pretrained=False):
         super().__init__()
@@ -215,15 +239,18 @@ class CustomModel(nn.Module):
             self.config = torch.load(config_path)
         if pretrained:
             self.model = AutoModel.from_pretrained(cfg.model, config=self.config)
+            self.xlnet = AutoModel.from_pretrained("chinese-xlnet-mid")
         else:
             self.model = AutoModel(self.config)
-        self.fc = nn.Linear(self.config.hidden_size, 5)
+            self.xlnet = AutoModel.from_pretrained("chinese-xlnet-mid")
+        self.fc = nn.Linear(self.config.hidden_size*8, 5)
         self._init_weights(self.fc)
         self.drop1=nn.Dropout(0.1)
         self.drop2=nn.Dropout(0.2)
         self.drop3=nn.Dropout(0.3)
         self.drop4=nn.Dropout(0.4)
         self.drop5=nn.Dropout(0.5)
+        self.head = AttentionHead(self.config.hidden_size*4, self.config.hidden_size)
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -238,19 +265,32 @@ class CustomModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         
-    def feature(self, inputs):
+    def feature(self, inputs, xlinputs):
         outputs = self.model(**inputs)
-        last_hidden_states = torch.mean(outputs[0], axis=1)
-        return last_hidden_states
+        xloutputs = self.xlnet(**xlinputs)
+        all_hidden_states = torch.stack(outputs.hidden_states)
+        # import pdb; pdb.set_trace()
+        xl_all_hidden_states = torch.stack(xloutputs.hidden_states)
+        cat_over_last_layers = torch.cat(
+            (all_hidden_states[-1], all_hidden_states[-2], xl_all_hidden_states[-1], xl_all_hidden_states[-1]),-1
+        )
+        
+        cls_pooling = cat_over_last_layers[:, 0]   
+        head_logits = self.head(cat_over_last_layers)
+        feature = torch.cat([head_logits, cls_pooling], -1)
+        return feature
     
     def loss(self,logits,labels):
-        # loss_fnc = MulticlassDiceLoss()
-        loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
+        loss_fnc = nn.CrossEntropyLoss()
+        # loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
         loss = loss_fnc(logits, labels)
         return loss
 
-    def forward(self, inputs,labels=None):
-        feature = self.feature(inputs)
+    def forward(self, tuples):
+        inputs = tuples[0]
+        xlinputs = tuples[1]
+        labels = tuples[2]
+        feature = self.feature(inputs, xlinputs)
         logits1 = self.fc(self.drop1(feature))
         logits2 = self.fc(self.drop2(feature))
         logits3 = self.fc(self.drop3(feature))
@@ -266,8 +306,8 @@ class CustomModel(nn.Module):
             loss4 = self.loss(logits4,labels)
             loss5 = self.loss(logits5,labels)
             _loss = (loss1 + loss2 + loss3 + loss4 + loss5)/5
-            
-        return output,_loss
+            return output, _loss
+        return output
 
 # %%
 # 模型训练常用工具类，记录指标变化
@@ -297,18 +337,23 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
     global_step = 0
     grad_norm = 0
     tk0=tqdm(enumerate(train_loader),total=len(train_loader))
-    for step, (inputs, labels) in tk0:
+    for step, (inputs, xlinputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
+        for k, v in xlinputs.items():
+            xlinputs[k] = v.to(device)
         labels = labels.to(device)
         batch_size = labels.size(0)
         with torch.cuda.amp.autocast(enabled=CFG.apex):
-            y_preds,loss = model(inputs,labels)
+            finput = [inputs,xlinputs,labels]
+            # import pdb; pdb.set_trace()
+            y_preds,loss = torch.nn.parallel.data_parallel(model, finput, device_ids=[0,1,2,3,4,5,6,7])
+            
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
-        losses.update(loss.item(), batch_size)
-        scaler.scale(loss).backward()
-        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+        losses.update(loss.mean().item(), batch_size)
+        scaler.scale(loss.mean()).backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
         if (step + 1) % CFG.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
@@ -329,16 +374,19 @@ def valid_fn(valid_loader, model, device):
     valid_true = []
     valid_pred = []
     tk0=tqdm(enumerate(valid_loader),total=len(valid_loader))
-    for step, (inputs, labels) in tk0:
+    for step, (inputs, xlinputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
+        for k, v in xlinputs.items():
+            xlinputs[k] = v.to(device)
         labels = labels.to(device)
         batch_size = labels.size(0)
         with torch.no_grad():
-            y_preds,loss = model(inputs,labels)
+            finput = [inputs,xlinputs,labels]
+            y_preds,loss = torch.nn.parallel.data_parallel(model, finput, device_ids=[0,1,2,3,4,5,6,7])
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
-        losses.update(loss.item(), batch_size)
+        losses.update(loss.mean().item(), batch_size)
         batch_pred = y_preds.detach().cpu().numpy()
         for item in batch_pred:
             valid_pred.append(item.argmax(-1))
@@ -449,7 +497,7 @@ def train_loop(folds, fold):
         if best_score < avg_f1s:
             best_score = avg_f1s
             LOGGER.info(f'Epoch {epoch+1} - Save Best Score: f1: {best_score:.4f} Model')
-            torch.save(model.state_dict(),OUTPUT_DIR+f"model_fold{fold}_best.bin")
+            torch.save(model.module.state_dict(),OUTPUT_DIR+f"model_fold{fold}_best.bin")
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -487,11 +535,17 @@ def test_and_save_reault(device, test_loader, test_ids, result_path):
         model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, f"model_fold{fold}_best.bin"),map_location=torch.device('cuda')))
         model.eval()
         tk0 = tqdm(test_loader, total=len(test_loader))
-        for inputs in tk0:
+        for step, (inputs, xlinputs) in tk0:
             for k, v in inputs.items():
                 inputs[k] = v.to(device)
+            for k, v in xlinputs.items():
+                xlinputs[k] = v.to(device)
             with torch.no_grad():
-                y_pred_pa_all,_ = model(inputs)
+                # y_pred_pa_all,_ = model(inputs)
+                # import pdb; pdb.set_trace()
+                finput = [inputs,xlinputs,None]
+                y_pred_pa_all = torch.nn.parallel.data_parallel(model, finput, device_ids=[0,1,2,3,4,5,6,7])
+                
             batch_pred = (y_pred_pa_all.detach().cpu().numpy())/CFG.n_fold
             if fold == 0:
                 raw_preds.append(batch_pred)
@@ -525,7 +579,7 @@ def test_and_save_reault(device, test_loader, test_ids, result_path):
 # valid
 test_dataset = TestDataset(CFG, test)
 test_loader = DataLoader(test_dataset,
-                  batch_size=256,
+                  batch_size=512,
                   shuffle=False,
                   num_workers=CFG.num_workers, pin_memory=True, drop_last=False)
 test_and_save_reault(device, test_loader, test_ids, OUTPUT_DIR+'output.txt')

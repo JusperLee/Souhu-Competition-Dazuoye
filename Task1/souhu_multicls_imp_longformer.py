@@ -1,16 +1,9 @@
-###
-# Author: Kai Li
-# Date: 2022-04-25 08:18:16
-# Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-04-27 07:56:37
-###
 # %%
 import os
 
-OUTPUT_DIR = './souhu_AE/'
+OUTPUT_DIR = './souhu_multicls_imp_longformer/'
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
-os.makedirs(os.path.join(OUTPUT_DIR, 'pretrain'), exist_ok=True)
 
 # %%
 import pandas as pd
@@ -39,6 +32,7 @@ from sklearn.model_selection import StratifiedKFold, GroupKFold, KFold,Stratifie
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.nn import Parameter
 import torch.nn.functional as F
 from torch.optim import Adam, SGD, AdamW
@@ -46,9 +40,8 @@ from torch.utils.data import DataLoader, Dataset
 import transformers
 print(f"transformers.__version__: {transformers.__version__}")
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from tokenizers import decoders
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-# from  dice_loss import  DiceLoss
+from  dice_loss import  DiceLoss
 transformers.logging.set_verbosity_error()
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -58,7 +51,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class CFG:
     apex=True
     num_workers=0
-    model="/home/likai/souhu/likai_task1/souhu_AE/pretrain/deberta-v3-base"    # huggingface 预训练模型
+    model="longformer-chinese-base-4096"    # huggingface 预训练模型
     scheduler='cosine'                   # ['linear', 'cosine'] # lr scheduler 类型
     batch_scheduler=True                 # 是否每个step结束后更新 lr scheduler
     num_cycles=0.5                       # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
@@ -67,11 +60,11 @@ class CFG:
     last_epoch=-1                        # 从第 last_epoch +1 个epoch开始训练
     encoder_lr=2e-5                      # 预训练模型内部参数的学习率
     decoder_lr=2e-5                      # 自定义输出层的学习率
-    batch_size=32                       
-    max_len=512                     
+    batch_size=64                       
+    max_len=600                     
     weight_decay=0.01        
-    gradient_accumulation_steps=1        # 梯度累计步数，1代表每个batch更新一次
-    # max_grad_norm=1000  
+    gradient_accumulation_steps=2        # 梯度累计步数，1代表每个batch更新一次
+    max_grad_norm=5  
     seed=42 
     n_fold=4                             # 总共划分数据的份数
     trn_fold=[0,1,2,3]                   # 需要训练的折数，比如一共划分了4份，则可以对应训练4个模型，1代表用编号为1的折做验证，其余折做训练
@@ -176,38 +169,15 @@ CFG.tokenizer = tokenizer
 # %%
 # 使用HF tokenzier 对输入（ 文本+ 情感关键词）进行编码，同一处理成CFG里定义的最大长度
 def prepare_input(cfg, text, feature_text):
-    
-    if len(text) > 460:
-        start = text.find(feature_text)
-        before = text[:start+len(feature_text)+1]
-        after = text[start+len(feature_text)+1:]
-        if len(before) >= 230 and len(after) >= 230:
-            text = text[start-230:start+230]
-        if len(before) >= 230 and len(after) < 230:
-            text = text[start-230:start+len(after)]
-        if len(before) < 230 and len(after) >= 230:
-            text = text[start-len(after):start+230]
-        # import pdb; pdb.set_trace()
-    aspect_from_pos = text.find(feature_text)
-    text = text[:aspect_from_pos+len(text)-len(text)]+'[AS]{}[AE]'.format(feature_text)+text[aspect_from_pos+len(feature_text):]
-    special_tokens_dict = {'additional_special_tokens': ['[AS]','[AE]']}
-    num_added_toks = CFG.tokenizer.add_special_tokens(special_tokens_dict)
-    inputs = cfg.tokenizer(text,
+    inputs = cfg.tokenizer(text, feature_text, 
                            add_special_tokens=True,
                            truncation = True,
                            max_length=CFG.max_len,
                            padding="max_length",
                            return_offsets_mapping=False)
-    
-    try:
-        idx = inputs['input_ids'].index(128001)
-    except ValueError:
-        import pdb; pdb.set_trace()
-    
     for k, v in inputs.items():
         inputs[k] = torch.tensor(v, dtype=torch.long)
-    return inputs, torch.tensor(idx, dtype=torch.long)
-
+    return inputs
 # 将tokenizer编码完成的输入 以及 对应的情感标签 处理成tensor，供模型训练
 class TrainDataset(Dataset):
     def __init__(self, cfg, df):
@@ -220,23 +190,32 @@ class TrainDataset(Dataset):
         return len(self.entitys)
 
     def __getitem__(self, item):
-        inputs, idx = prepare_input(self.cfg, 
+        inputs = prepare_input(self.cfg, 
                                self.contents[item], 
                                self.entitys[item])
         labels = torch.tensor(self.labels[item], dtype=torch.long)
-        return inputs, idx, labels
+        return inputs, labels
 
-# # 测试dataset
-# from tqdm import tqdm
-# testdataset = TrainDataset(CFG, train)
-# for idx in tqdm(range(len(testdataset))):
-#     inputs, idxs, labels = testdataset[idx]
-
-# import pdb; pdb.set_trace()
 # %%
 # 定义模型结构，该结构是取预训练模型最后一层encoder输出，形状为[batch_size, sequence_length, hidden_size]，
 # 在1维取平均，得到[batch_size, hidden_size]的特征向量，传递给分类层得到[batch_size, 5]的向量输出，代表每条文本在五个类别上的得分，最后使用softmax将得分规范化
 # 训练过程中额外对 取平均后的输出做了5次dropout，并计算五次loss取平均，该方法可以加速模型收敛，相关思路可参考论文： https://arxiv.org/pdf/1905.09788.pdf
+
+class AttentionHead(nn.Module):
+    def __init__(self, h_size, hidden_dim=512):
+        super().__init__()
+        self.W = nn.Linear(h_size, hidden_dim)
+        self.V = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, features):
+        att = torch.tanh(self.W(features))
+        score = self.V(att)
+        attention_weights = torch.softmax(score, dim=1)
+        context_vector = attention_weights * features
+        context_vector = torch.sum(context_vector, dim=1)
+
+        return context_vector
+
 class CustomModel(nn.Module):
     def __init__(self, cfg, config_path=None, pretrained=False):
         super().__init__()
@@ -246,16 +225,17 @@ class CustomModel(nn.Module):
         else:
             self.config = torch.load(config_path)
         if pretrained:
-            self.model = AutoModel.from_pretrained(cfg.model, config=self.config)
+            self.pretrain_model = AutoModel.from_pretrained(cfg.model, config=self.config)
         else:
-            self.model = AutoModel(self.config)
-        self.fc = nn.Linear(self.config.hidden_size, 5)
+            self.pretrain_model = AutoModel(self.config)
+        self.fc = nn.Linear(self.config.hidden_size*8, 5)
         self._init_weights(self.fc)
         self.drop1=nn.Dropout(0.1)
         self.drop2=nn.Dropout(0.2)
         self.drop3=nn.Dropout(0.3)
         self.drop4=nn.Dropout(0.4)
         self.drop5=nn.Dropout(0.5)
+        self.head = AttentionHead(self.config.hidden_size*4, self.config.hidden_size)
         
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -270,19 +250,26 @@ class CustomModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         
-    def feature(self, inputs, idxs):
-        outputs = self.model(**inputs, output_hidden_states=True)
-        last_hidden_states = outputs.last_hidden_state[0, idxs]
-        return last_hidden_states
+    def feature(self, inputs):
+        outputs = self.pretrain_model(**inputs)
+        all_hidden_states = torch.stack(outputs.hidden_states)
+        cat_over_last_layers = torch.cat(
+            (all_hidden_states[-1], all_hidden_states[-2], all_hidden_states[-3], all_hidden_states[-4]),-1
+        )
+        
+        cls_pooling = cat_over_last_layers[:, 0]   
+        head_logits = self.head(cat_over_last_layers)
+        feature = torch.cat([head_logits, cls_pooling], -1)
+        return feature
     
-    def loss(self, logits, labels):
-        loss_fnc = nn.CrossEntropyLoss()
-        # loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
-        loss = loss_fnc(logits, labels)
+    def loss(self,logits,labels):
+        loss_fnc1 = nn.CrossEntropyLoss()
+        loss_fnc2 = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
+        loss = 0.8*loss_fnc1(logits, labels) + 0.2*loss_fnc2(logits, labels)
         return loss
 
-    def forward(self, inputs, idxs, labels=None):
-        feature = self.feature(inputs, idxs)
+    def forward(self, inputs,labels=None):
+        feature = self.feature(inputs)
         logits1 = self.fc(self.drop1(feature))
         logits2 = self.fc(self.drop2(feature))
         logits3 = self.fc(self.drop3(feature))
@@ -329,19 +316,18 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
     global_step = 0
     grad_norm = 0
     tk0=tqdm(enumerate(train_loader),total=len(train_loader))
-    for step, (inputs, idxs, labels) in tk0:
+    for step, (inputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
         labels = labels.to(device)
-        idxs = idxs.to(device)
         batch_size = labels.size(0)
         with torch.cuda.amp.autocast(enabled=CFG.apex):
-            y_preds,loss = model(inputs, idxs, labels)
+            y_preds,loss = model(inputs,labels)
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
-        losses.update(loss.item(), batch_size)
-        scaler.scale(loss).backward()
-        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+        losses.update(loss.mean().item(), batch_size)
+        scaler.scale(loss.mean()).backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
         if (step + 1) % CFG.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
@@ -362,17 +348,16 @@ def valid_fn(valid_loader, model, device):
     valid_true = []
     valid_pred = []
     tk0=tqdm(enumerate(valid_loader),total=len(valid_loader))
-    for step, (inputs, idxs, labels) in tk0:
+    for step, (inputs, labels) in tk0:
         for k, v in inputs.items():
             inputs[k] = v.to(device)
         labels = labels.to(device)
-        idxs = idxs.to(device)
         batch_size = labels.size(0)
         with torch.no_grad():
-            y_preds,loss = model(inputs,idxs,labels)
+            y_preds,loss = model(inputs,labels)
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
-        losses.update(loss.item(), batch_size)
+        losses.update(loss.mean().item(), batch_size)
         batch_pred = y_preds.detach().cpu().numpy()
         for item in batch_pred:
             valid_pred.append(item.argmax(-1))
@@ -406,12 +391,12 @@ def train_loop(folds, fold):
     valid_dataset = TrainDataset(CFG, valid_folds)
 
     train_loader = DataLoader(train_dataset,
-                              batch_size=CFG.batch_size,
                               shuffle=True,
+                              batch_size=CFG.batch_size,
                               num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
     valid_loader = DataLoader(valid_dataset,
-                              batch_size=CFG.batch_size,
                               shuffle=False,
+                              batch_size=CFG.batch_size,
                               num_workers=CFG.num_workers, pin_memory=True, drop_last=False)
     print(len(train_loader),len(valid_loader))
 
@@ -422,15 +407,15 @@ def train_loop(folds, fold):
     model = CustomModel(CFG, config_path=None, pretrained=True)
     torch.save(model.config, OUTPUT_DIR+'config.pth')
     
-    model.to(device)
+    model = model.to(device)
     
     def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
         param_optimizer = list(model.named_parameters())
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
         optimizer_parameters = [
-            {'params': [p for n, p in model.model.named_parameters() if not any(nd in n for nd in no_decay)],
+            {'params': [p for n, p in model.pretrain_model.named_parameters() if not any(nd in n for nd in no_decay)],
              'lr': encoder_lr, 'weight_decay': weight_decay, 'initial_lr':encoder_lr},
-            {'params': [p for n, p in model.model.named_parameters() if any(nd in n for nd in no_decay)],
+            {'params': [p for n, p in model.pretrain_model.named_parameters() if any(nd in n for nd in no_decay)],
              'lr': encoder_lr, 'weight_decay': 0.0, 'initial_lr':encoder_lr},
             {'params': [p for n, p in model.named_parameters() if "model" not in n],
              'lr': decoder_lr, 'weight_decay': 0.0, 'initial_lr':decoder_lr}
@@ -463,7 +448,7 @@ def train_loop(folds, fold):
     # ====================================================
     # loop
     # ====================================================
-
+    model = torch.nn.DataParallel(model, device_ids=[0,1], output_device=0)
     for epoch in range(CFG.epochs-1-CFG.last_epoch):
 
         start_time = time.time()
@@ -483,7 +468,7 @@ def train_loop(folds, fold):
         if best_score < avg_f1s:
             best_score = avg_f1s
             LOGGER.info(f'Epoch {epoch+1} - Save Best Score: f1: {best_score:.4f} Model')
-            torch.save(model.state_dict(),OUTPUT_DIR+f"model_fold{fold}_best.bin")
+            torch.save(model.module.state_dict(),OUTPUT_DIR+f"model_fold{fold}_best.bin")
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -506,10 +491,10 @@ class TestDataset(Dataset):
         return len(self.entitys)
 
     def __getitem__(self, item):
-        inputs, idxs = prepare_input(self.cfg, 
+        inputs = prepare_input(self.cfg, 
                                self.contents[item], 
                                self.entitys[item])
-        return inputs, idxs
+        return inputs
 def test_and_save_reault(device, test_loader, test_ids, result_path):
     raw_preds = []
     test_pred = []
@@ -521,12 +506,11 @@ def test_and_save_reault(device, test_loader, test_ids, result_path):
         model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, f"model_fold{fold}_best.bin"),map_location=torch.device('cuda')))
         model.eval()
         tk0 = tqdm(test_loader, total=len(test_loader))
-        for step, (inputs, idxs) in tk0:
+        for inputs in tk0:
             for k, v in inputs.items():
                 inputs[k] = v.to(device)
-            idxs = idxs.to(device)
             with torch.no_grad():
-                y_pred_pa_all,_ = model(inputs, idxs)
+                y_pred_pa_all,_ = model(inputs)
             batch_pred = (y_pred_pa_all.detach().cpu().numpy())/CFG.n_fold
             if fold == 0:
                 raw_preds.append(batch_pred)
@@ -560,7 +544,7 @@ def test_and_save_reault(device, test_loader, test_ids, result_path):
 # valid
 test_dataset = TestDataset(CFG, test)
 test_loader = DataLoader(test_dataset,
-                  batch_size=256,
+                  batch_size=128,
                   shuffle=False,
                   num_workers=CFG.num_workers, pin_memory=True, drop_last=False)
 test_and_save_reault(device, test_loader, test_ids, OUTPUT_DIR+'output.txt')

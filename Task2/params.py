@@ -1,0 +1,9 @@
+BATCH_SZ = 1024
+EPOCH = 10
+LR = 0.001
+device = "cuda:4"
+EMBED_DIM = 32
+EMBED_L2 = None
+TRAIN_FILE = './data/train/sample.csv'
+TEST_FILE = './data/evaluate/sample.csv'
+SEED = 0

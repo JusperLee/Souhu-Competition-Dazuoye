@@ -1,13 +1,13 @@
 ###
 # Author: Kai Li
-# Date: 2022-05-02 09:59:18
+# Date: 2022-05-02 09:57:56
 # Email: lk21@mails.tsinghua.edu.cn
-# LastEditTime: 2022-05-02 10:04:42
+# LastEditTime: 2022-05-02 10:33:11
 ###
 # %%
 import os
 
-OUTPUT_DIR = './souhu_gradnorm/'
+OUTPUT_DIR = './souhu_diceloss/'
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
@@ -46,7 +46,7 @@ import transformers
 print(f"transformers.__version__: {transformers.__version__}")
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-# from  dice_loss import  DiceLoss
+from  dice_loss import  DiceLoss
 transformers.logging.set_verbosity_error()
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -56,7 +56,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class CFG:
     apex=True
     num_workers=0
-    model="microsoft/deberta-v3-base"    # huggingface 预训练模型
+    model="/data/home/scv1134/run/likai/souhu/likai_task1/souhu_AE/pretrain/deberta-v3-base"    # huggingface 预训练模型
     scheduler='cosine'                   # ['linear', 'cosine'] # lr scheduler 类型
     batch_scheduler=True                 # 是否每个step结束后更新 lr scheduler
     num_cycles=0.5                       # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
@@ -69,7 +69,7 @@ class CFG:
     max_len=512                     
     weight_decay=0.01        
     gradient_accumulation_steps=1        # 梯度累计步数，1代表每个batch更新一次
-    max_grad_norm=1000  
+    # max_grad_norm=1000  
     seed=42 
     n_fold=4                             # 总共划分数据的份数
     trn_fold=[0,1,2,3]                   # 需要训练的折数，比如一共划分了4份，则可以对应训练4个模型，1代表用编号为1的折做验证，其余折做训练
@@ -244,8 +244,8 @@ class CustomModel(nn.Module):
         return last_hidden_states
     
     def loss(self,logits,labels):
-        loss_fnc = nn.CrossEntropyLoss()
-        # loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
+        # loss_fnc = MulticlassDiceLoss()
+        loss_fnc = DiceLoss(smooth = 1, square_denominator = True, with_logits = True,  alpha = 0.01 )
         loss = loss_fnc(logits, labels)
         return loss
 
@@ -308,7 +308,7 @@ def train_fn(fold, train_loader,model, optimizer, epoch, scheduler, device):
             loss = loss / CFG.gradient_accumulation_steps
         losses.update(loss.item(), batch_size)
         scaler.scale(loss).backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
         if (step + 1) % CFG.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
